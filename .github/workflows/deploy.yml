@@ -1,0 +1,95 @@
+name: Deploy with CloudFormation
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    env:
+      AWS_REGION: us-east-1
+      STACK_NAME: s3-whatsapp-notifier-stack
+      ARTIFACT_BUCKET: s3-whatsapp-notifier-artifacts
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      - name: Create/Update S3 bucket for artifacts
+        run: |
+          if ! aws s3 ls "s3://${ARTIFACT_BUCKET}" 2>&1 > /dev/null; then
+            aws s3 mb "s3://${ARTIFACT_BUCKET}"
+            aws s3api put-bucket-versioning \
+              --bucket ${ARTIFACT_BUCKET} \
+              --versioning-configuration Status=Enabled
+          fi
+
+      - name: Package CloudFormation template
+        run: |
+          aws cloudformation package \
+            --template-file template.yaml \
+            --s3-bucket ${ARTIFACT_BUCKET} \
+            --output-template-file packaged.yaml
+
+      - name: Deploy CloudFormation stack
+        run: |
+          aws cloudformation deploy \
+            --template-file packaged.yaml \
+            --stack-name ${STACK_NAME} \
+            --capabilities CAPABILITY_IAM \
+            --parameter-overrides \
+              GitHubOwner=${{ github.repository_owner }} \
+              GitHubRepo=${{ github.event.repository.name }} \
+              GitHubBranch=${GITHUB_REF##*/} \
+              GitHubSecretToken=${{ secrets.GITHUB_TOKEN }} \
+              TwilioAccountSid=${{ secrets.TWILIO_ACCOUNT_SID }} \
+              TwilioAuthToken=${{ secrets.TWILIO_AUTH_TOKEN }} \
+              WhatsAppFrom=${{ secrets.WHATSAPP_FROM }} \
+              WhatsAppTo=${{ secrets.WHATSAPP_TO }}
+
+      - name: Verify deployment
+        run: |
+          STATUS=$(aws cloudformation describe-stacks \
+            --stack-name ${STACK_NAME} \
+            --query 'Stacks[0].StackStatus' \
+            --output text)
+          
+          if [ "$STATUS" != "CREATE_COMPLETE" ] && [ "$STATUS" != "UPDATE_COMPLETE" ]; then
+            echo "Deployment failed with status: $STATUS"
+            exit 1
+          fi
+          
+          echo "Deployment successful! Stack status: $STATUS"
+
+      - name: Output Stack Information
+        run: |
+          aws cloudformation describe-stacks \
+            --stack-name ${STACK_NAME} \
+            --query 'Stacks[0].Outputs' \
+            --output table
